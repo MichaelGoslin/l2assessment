@@ -14,7 +14,7 @@ const HIGH_SIGNALS = [
   { label: 'production impact', pattern: /\bproduction\b|\ball (of our |our )?(users|customers)\b|\beveryone\b/i },
   { label: 'data loss', pattern: /\b(data loss|lost (all|my|our) (data|work|files))\b|\bdata (is |was )?(gone|deleted|missing)\b/i },
   { label: 'security concern', pattern: /\b(security|breach|hacked|compromised|unauthori[sz]ed|fraud(ulent)?|phishing)\b/i },
-  { label: 'failed or duplicate payment', pattern: /\bpayment (failed|declined|bounced)\b|\b(charged|billed) (twice|double|two times)\b|\bdouble[- ]charged\b/i },
+  { label: 'failed or duplicate payment', pattern: /\bpayment (failed|declined|bounced)\b|\b(charged|billed) (twice|double|two times)\b|\bdouble[- ]charged?\b/i },
   { label: 'customer flagged as urgent', pattern: /\b(urgent|urgently|asap|emergency|immediately|critical)\b/i },
 ]
 

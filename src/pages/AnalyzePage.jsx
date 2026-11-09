@@ -1,8 +1,28 @@
 import { useState, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { categorizeMessage } from '../utils/llmHelper'
-import { combineUrgency } from '../utils/urgencyScorer'
-import { getRecommendedAction, shouldEscalate } from '../utils/templates'
+import { triageMessage } from '../utils/triage'
+
+const urgencyStyles = {
+  High: 'bg-red-200 text-red-900',
+  Medium: 'bg-yellow-200 text-yellow-900',
+  Low: 'bg-green-200 text-green-900',
+}
+
+const sentimentStyles = {
+  Hostile: 'bg-red-100 text-red-800',
+  Negative: 'bg-orange-100 text-orange-800',
+  Neutral: 'bg-gray-100 text-gray-800',
+  Positive: 'bg-green-100 text-green-800',
+}
+
+function Field({ label, children }) {
+  return (
+    <div>
+      <div className="text-sm font-semibold text-gray-600 mb-1">{label}</div>
+      {children}
+    </div>
+  )
+}
 
 function AnalyzePage() {
   const [message, setMessage] = useState('')
@@ -26,32 +46,14 @@ function AnalyzePage() {
 
     setIsLoading(true)
     setResults(null)
-    
+
     try {
-      // Run categorization (LLM call)
-      const { category, reasoning, urgency: aiUrgency, source } = await categorizeMessage(message)
-      
-      // Calculate urgency (rule-based)
-      const { level: urgency, signals: urgencySignals } = combineUrgency(message, aiUrgency)
-      
-      // Get recommended action (template-based)
-      const recommendedAction = getRecommendedAction(category, urgency)
-      
-      const analysisResult = {
-        message,
-        category,
-        urgency,
-        recommendedAction,
-        reasoning,
-        urgencySignals,
-        escalate: shouldEscalate(category, urgency),
-        source,
-        timestamp: new Date().toISOString()
-      }
+      const triage = await triageMessage(message)
+      const analysisResult = { message, ...triage, timestamp: new Date().toISOString() }
 
       setResults(analysisResult)
 
-      // Save to history
+      // Save the full validated triage record to history
       const history = JSON.parse(localStorage.getItem('triageHistory') || '[]')
       history.push(analysisResult)
       localStorage.setItem('triageHistory', JSON.stringify(history))
@@ -67,6 +69,8 @@ function AnalyzePage() {
     setMessage('')
     setResults(null)
   }
+
+  const { message: _message, timestamp: _timestamp, ...triageJson } = results || {}
 
   return (
     <div className="min-h-screen bg-gray-50 py-8">
@@ -131,47 +135,83 @@ function AnalyzePage() {
         {results && (
           <div className="bg-white rounded-lg shadow-md p-6">
             <h2 className="text-xl font-bold text-gray-900 mb-4">Analysis Results</h2>
-            
+
+            {results.escalation.required && (
+              <div className="mb-4 bg-red-50 border border-red-300 rounded-lg p-4">
+                <div className="font-semibold text-red-900">
+                  Escalate to {results.escalation.target}
+                  {results.escalation.notify.length > 0 && ` (also notify ${results.escalation.notify.join(', ')})`}
+                </div>
+                <div className="text-sm text-red-800 mt-1">Why: {results.escalation.reasons.join('; ')}</div>
+              </div>
+            )}
+
             <div className="space-y-4">
-              <div>
-                <div className="text-sm font-semibold text-gray-600 mb-1">Category</div>
-                <div className="inline-block bg-blue-100 text-blue-800 px-4 py-2 rounded-lg font-semibold">
-                  {results.category}
-                </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Field label="Category">
+                  <div className="inline-block bg-blue-100 text-blue-800 px-4 py-2 rounded-lg font-semibold">
+                    {results.category}
+                  </div>
+                  {results.secondaryCategories.length > 0 && (
+                    <p className="text-sm text-gray-600 mt-2">Also mentions: {results.secondaryCategories.join(', ')}</p>
+                  )}
+                </Field>
+
+                <Field label="Route to">
+                  <div className="inline-block bg-indigo-100 text-indigo-800 px-4 py-2 rounded-lg font-semibold">
+                    {results.routeTo}
+                  </div>
+                </Field>
+
+                <Field label="Urgency Level">
+                  <div className={`inline-block px-4 py-2 rounded-lg font-semibold ${urgencyStyles[results.urgency]}`}>
+                    {results.urgency}
+                  </div>
+                </Field>
+
+                <Field label="Customer Sentiment">
+                  <div className={`inline-block px-4 py-2 rounded-lg font-semibold ${sentimentStyles[results.sentiment]}`}>
+                    {results.sentiment}
+                  </div>
+                  {results.churnRisk && (
+                    <span className="ml-3 inline-block bg-orange-600 text-white px-3 py-1 rounded-full text-sm font-semibold">
+                      Churn risk
+                    </span>
+                  )}
+                </Field>
               </div>
 
-              <div>
-                <div className="text-sm font-semibold text-gray-600 mb-1">Urgency Level</div>
-                <div className={`inline-block px-4 py-2 rounded-lg font-semibold ${
-                  results.urgency === 'High' ? 'bg-red-200 text-red-900' :
-                  results.urgency === 'Medium' ? 'bg-yellow-200 text-yellow-900' :
-                  'bg-green-200 text-green-900'
-                }`}>
-                  {results.urgency}
-                </div>
-                {results.escalate && (
-                  <span className="ml-3 inline-block bg-red-600 text-white px-3 py-1 rounded-full text-sm font-semibold">
-                    Escalate
-                  </span>
-                )}
-                <p className="text-sm text-gray-600 mt-2">
-                  {results.urgencySignals?.length
-                    ? `Why: ${results.urgencySignals.join(', ')}`
-                    : 'Why: no outage, access, payment, or error signals found'}
+              <Field label="Signals detected">
+                <p className="text-sm text-gray-700">
+                  {results.signals.length ? results.signals.join(', ') : 'No outage, access, payment, error, anger, or churn signals found'}
                 </p>
-              </div>
+              </Field>
 
-              <div>
-                <div className="text-sm font-semibold text-gray-600 mb-1">Recommended Action</div>
+              <Field label="Confidence">
+                <div className="flex items-center gap-3">
+                  <div className="w-40 h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full ${results.needsHumanReview ? 'bg-red-500' : results.confidence >= 0.8 ? 'bg-green-500' : 'bg-yellow-500'}`}
+                      style={{ width: `${Math.round(results.confidence * 100)}%` }}
+                    />
+                  </div>
+                  <span className="font-semibold text-gray-800">{Math.round(results.confidence * 100)}%</span>
+                  {results.needsHumanReview && (
+                    <span className="text-sm font-semibold text-red-700">Needs human review</span>
+                  )}
+                </div>
+                {results.confidenceNotes.length > 0 && (
+                  <p className="text-sm text-gray-600 mt-1">{results.confidenceNotes.join('; ')}</p>
+                )}
+              </Field>
+
+              <Field label="Recommended Action">
                 <div className="bg-purple-50 border border-purple-200 rounded-lg p-4">
                   <p className="text-gray-800">{results.recommendedAction}</p>
                 </div>
-              </div>
+              </Field>
 
-              <div>
-                <div className="text-sm font-semibold text-gray-600 mb-1">
-                  {results.source === 'offline' ? 'Reasoning (offline keyword fallback, AI unavailable)' : 'AI Reasoning'}
-                </div>
+              <Field label={results.source === 'offline' ? `Reasoning (offline fallback: ${results.fallbackReason})` : 'AI Reasoning'}>
                 <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
                   <div className="prose prose-sm max-w-none text-gray-700">
                     <ReactMarkdown>
@@ -179,15 +219,23 @@ function AnalyzePage() {
                     </ReactMarkdown>
                   </div>
                 </div>
-              </div>
+              </Field>
+
+              <details className="border border-gray-200 rounded-lg">
+                <summary className="cursor-pointer px-4 py-2 text-sm font-semibold text-gray-700">
+                  Triage record (validated JSON)
+                </summary>
+                <pre className="text-xs bg-gray-900 text-gray-100 p-4 overflow-x-auto rounded-b-lg">
+                  {JSON.stringify(triageJson, null, 2)}
+                </pre>
+              </details>
             </div>
 
             <div className="mt-6 pt-4 border-t border-gray-200">
               <button
                 onClick={() => {
-                  const text = `Category: ${results.category}\nUrgency: ${results.urgency}\nRecommendation: ${results.recommendedAction}\n\nReasoning: ${results.reasoning}`
-                  navigator.clipboard.writeText(text)
-                  alert('Results copied to clipboard!')
+                  navigator.clipboard.writeText(JSON.stringify(triageJson, null, 2))
+                  alert('Triage record copied to clipboard!')
                 }}
                 className="bg-gray-100 text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-200 font-semibold"
               >

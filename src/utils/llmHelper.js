@@ -1,38 +1,59 @@
 import Groq from 'groq-sdk';
+import { z } from 'zod';
 
 /**
  * LLM Helper for categorizing customer support messages
- * Using Groq API for AI-powered categorization
+ * Using Groq API for AI-powered categorization, with a deterministic
+ * keyword fallback when the API is unavailable or returns bad output.
  */
 
 export const CATEGORIES = [
   "Billing Issue",
   "Technical Problem",
+  "Service Complaint",
   "Feature Request",
   "General Inquiry",
   "Positive Feedback",
 ];
 
 const URGENCY_LEVELS = ["High", "Medium", "Low"];
+const SENTIMENTS = ["Hostile", "Negative", "Neutral", "Positive"];
 
 const SYSTEM_PROMPT = `You triage customer support messages for a SaaS company.
 Return ONLY a JSON object with these keys:
-- "category": exactly one of ${CATEGORIES.map(c => `"${c}"`).join(", ")}
+- "category": the main topic, exactly one of ${CATEGORIES.map(c => `"${c}"`).join(", ")}
+- "secondary_categories": array of any other topics from the same list that the message also raises (empty array if none)
 - "urgency": exactly one of "High", "Medium", "Low"
+- "sentiment": exactly one of "Hostile", "Negative", "Neutral", "Positive"
+- "churn_risk": true if the customer threatens to cancel, leave, switch providers, or dispute a charge; otherwise false
 - "reasoning": one or two sentences explaining the category and urgency
 
 Category definitions:
 - Billing Issue: payments, charges, invoices, refunds, plan or subscription changes.
 - Technical Problem: errors, bugs, outages, pages not loading, login or access problems.
+- Service Complaint: complaints about our support itself, such as slow or missing replies or poor treatment.
 - Feature Request: asking for new functionality or a change to how the product works.
 - General Inquiry: questions about the product, company, or policies with no problem reported.
 - Positive Feedback: praise or thanks with no request or problem.
-If a message mixes billing and technical problems, pick the one that blocks the customer most.
+If a message mixes topics, choose the one that blocks the customer most as "category" and list the rest in "secondary_categories".
 
 Urgency is about business impact, not tone, length, or punctuation:
-- High: outage, data loss, security concern, customer locked out, failed payment blocking access, many users affected.
+- High: outage, data loss, security concern, customer locked out, failed or duplicate payment, many users affected, cancellation threat, or a hostile customer asking for a manager.
 - Medium: something is broken or wrong for one customer but they can keep working.
 - Low: questions, feature requests, feedback, thanks.`;
+
+/**
+ * Shape of the model's JSON reply. Types are enforced here, in code,
+ * rather than trusting the prompt. Values are normalized afterwards.
+ */
+const AiReplySchema = z.object({
+  category: z.string().min(1),
+  secondary_categories: z.array(z.string()).optional().default([]),
+  urgency: z.string().optional(),
+  sentiment: z.string().optional(),
+  churn_risk: z.boolean().optional(),
+  reasoning: z.string().optional(),
+});
 
 let groqClient = null;
 
@@ -50,43 +71,58 @@ function getGroqClient() {
   return groqClient;
 }
 
+// Case-insensitive match against an allowed list; null if not allowed.
+const pick = (allowed, value) =>
+  allowed.find(a => a.toLowerCase() === String(value ?? '').trim().toLowerCase()) ?? null;
+
 /**
  * Parse and validate the model's JSON reply.
- * Anything outside the allowed categories becomes "Unknown" so it gets
- * reviewed by a person instead of being silently misrouted.
+ * Throws if the reply is not JSON or has the wrong shape, so the caller
+ * can fall back. An off-list category becomes "Unknown" so a person
+ * reviews it instead of the ticket being silently misrouted.
  *
  * @param {string} content - Raw model output
- * @returns {{category: string, urgency: string|null, reasoning: string}}
  */
 export function parseCategorization(content) {
-  let data;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('Model returned an empty reply');
+  }
+
+  let raw;
   try {
-    data = JSON.parse(content);
+    raw = JSON.parse(content);
   } catch {
     const match = content.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('Model did not return JSON');
-    data = JSON.parse(match[0]);
+    raw = JSON.parse(match[0]);
   }
 
-  const category = CATEGORIES.find(c => c.toLowerCase() === String(data.category || '').trim().toLowerCase()) || "Unknown";
-  const urgency = URGENCY_LEVELS.find(u => u.toLowerCase() === String(data.urgency || '').trim().toLowerCase()) || null;
-  const reasoning = typeof data.reasoning === 'string' && data.reasoning.trim()
-    ? data.reasoning.trim()
-    : "No reasoning returned by the model.";
+  const data = AiReplySchema.parse(raw);
+  const category = pick(CATEGORIES, data.category) ?? "Unknown";
+  const secondaryCategories = [...new Set(
+    data.secondary_categories.map(c => pick(CATEGORIES, c)).filter(c => c && c !== category)
+  )];
 
-  return { category, urgency, reasoning };
+  return {
+    category,
+    secondaryCategories,
+    urgency: pick(URGENCY_LEVELS, data.urgency),
+    sentiment: pick(SENTIMENTS, data.sentiment),
+    churnRisk: data.churn_risk ?? null,
+    reasoning: data.reasoning?.trim() || "No reasoning returned by the model.",
+  };
 }
 
 /**
  * Categorize a customer support message using Groq AI
  *
  * @param {string} message - The customer support message
- * @returns {Promise<{category: string, urgency: string|null, reasoning: string, source: 'ai'|'offline'}>}
+ * @param {{ client?: object|null }} [options] - Inject a client (used by tests)
  */
-export async function categorizeMessage(message) {
-  const groq = getGroqClient();
+export async function categorizeMessage(message, { client } = {}) {
+  const groq = client === undefined ? getGroqClient() : client;
   if (!groq) {
-    return { ...getMockCategorization(message), urgency: null, source: 'offline' };
+    return getOfflineCategorization(message, 'No API key configured');
   }
 
   try {
@@ -100,123 +136,61 @@ export async function categorizeMessage(message) {
       response_format: { type: "json_object" },
     });
 
-    return { ...parseCategorization(response.choices[0].message.content), source: 'ai' };
+    return { ...parseCategorization(response.choices?.[0]?.message?.content), source: 'ai', fallbackReason: null };
   } catch (error) {
-    console.warn('Groq API failed, using offline categorization:', error.message);
-    return { ...getMockCategorization(message), urgency: null, source: 'offline' };
+    console.warn('Groq API failed or returned invalid output, using offline categorization:', error.message);
+    return getOfflineCategorization(message, `AI unavailable or invalid reply (${error.name === 'ZodError' ? 'wrong JSON shape' : error.message})`);
   }
 }
 
+const KEYWORD_RULES = [
+  { category: "Billing Issue", pattern: /\b(bill(s|ing|ed)?|payments?|charged?|charges|invoices?|credit card|subscriptions?|refund(s|ed)?|plan|upgrade|downgrade|pricing)\b/gi },
+  { category: "Technical Problem", pattern: /\b(bugs?|errors?|broken|not working|doesn'?t work|crash(es|ed|ing)?|down|server|loading|won'?t load|slow|timing out|timeout|can'?t access|locked out|connection lost|glitch|throws)\b/gi },
+  { category: "Service Complaint", pattern: /\b(no (one )?(answer|response|reply)|still waiting|(emailed|called|contacted) (you )?(two|three|four|five|several|multiple|\d+) times|unacceptable|terrible service|worst (service|support)|manager|supervisor)\b/gi },
+  { category: "Feature Request", pattern: /\b(feature|could you (add|build|make|support)|please add|would like to see|suggestion|wish|enhancement|would be (great|nice|useful|helpful)|add (a|an) [\w\s]{0,20}option)\b/gi },
+];
+
+const PRAISE = /\b(thank|thanks|appreciate|great (work|job)|love (it|your)|positive feedback|keep up)\b/i;
+const PROBLEM = /\b(but|however|error|issue|problem|broken|can'?t|cannot|not working|down)\b/i;
+const QUESTION = /\b(how|what|when|where|can i|is there|do you)\b|\?/i;
+
 /**
- * Mock categorization for when API is unavailable
+ * Deterministic keyword categorization. Returns every category whose
+ * keywords appear, in priority order, with the words that matched.
+ *
+ * @param {string} message
+ * @returns {{ category: string, terms: string[] }[]}
  */
-function getMockCategorization(message) {
-  const lowerMessage = message.toLowerCase();
-  
-  // Array of possible reasoning variations for each category
-  const reasoningVariations = {
-    billing: [
-      "Based on keywords related to payments and billing, this appears to be a billing-related inquiry. The customer may need assistance with account charges or payment issues.",
-      "This message contains billing terminology. The customer is likely experiencing issues with payments, invoices, or account charges.",
-      "The message references financial matters related to the customer's account. This suggests a billing or payment concern that requires attention.",
-    ],
-    technical: [
-      "This message describes technical difficulties or system errors. The customer is reporting functionality issues that may require engineering review.",
-      "Based on error-related keywords, this appears to be a technical support issue. The customer is experiencing problems with product functionality.",
-      "The message indicates a technical problem or bug. This requires investigation from the technical support team.",
-      "System-related issues are mentioned in this message. The customer needs technical assistance to resolve functionality problems.",
-    ],
-    feature: [
-      "This message suggests improvements or new functionality. The customer is providing product feedback and feature suggestions.",
-      "The customer is requesting enhancements to the product. This appears to be a feature request that should be reviewed by the product team.",
-      "Based on the language used, this seems to be a suggestion for product improvements rather than a support issue.",
-    ],
-    inquiry: [
-      "This appears to be a general question about the product or service. The customer is seeking information or clarification.",
-      "The message contains questions that don't indicate a specific problem. This is likely a general inquiry requiring informational support.",
-      "Based on the question format, this seems to be an information request rather than a technical or billing issue.",
-    ],
-    positive: [
-      "This message contains positive sentiment and appreciation. While not a support request, it may warrant acknowledgment.",
-      "The customer is expressing satisfaction or gratitude. This doesn't appear to require immediate support action.",
-    ],
-    ambiguous: [
-      "The message content is unclear or doesn't match standard support categories. Manual review may be needed for proper categorization.",
-      "This message doesn't contain clear indicators for automatic categorization. Human review recommended.",
-    ]
-  };
-  
-  // Helper to get random reasoning
-  const getRandomReasoning = (category) => {
-    const reasons = reasoningVariations[category];
-    return reasons[Math.floor(Math.random() * reasons.length)];
-  };
-  
-  // Positive feedback with no problem in it
-  const isPraise = ['thank', 'appreciate', 'great work', 'great job', 'love it', 'love your', 'positive feedback', 'keep up']
-    .some(word => lowerMessage.includes(word));
-  const mentionsProblem = ['but', 'however', 'error', 'issue', 'problem', 'broken', "can't", 'cannot', 'not working', 'down']
-    .some(word => lowerMessage.includes(word));
-  if (isPraise && !mentionsProblem) {
-    return {
-      category: "Positive Feedback",
-      reasoning: getRandomReasoning('positive')
-    };
+export function keywordCategories(message) {
+  const text = message || '';
+  if (PRAISE.test(text) && !PROBLEM.test(text)) {
+    return [{ category: "Positive Feedback", terms: [text.match(PRAISE)[0].toLowerCase()] }];
   }
 
-  // Billing-related detection
-  if (lowerMessage.includes('bill') || lowerMessage.includes('payment') || 
-      lowerMessage.includes('charge') || lowerMessage.includes('invoice') ||
-      lowerMessage.includes('credit card') || lowerMessage.includes('subscription') ||
-      lowerMessage.includes('refund') || lowerMessage.includes('cancel') && lowerMessage.includes('account')) {
-    return {
-      category: "Billing Issue",
-      reasoning: getRandomReasoning('billing')
-    };
+  const found = KEYWORD_RULES
+    .map(rule => ({ category: rule.category, terms: [...new Set((text.match(rule.pattern) || []).map(t => t.toLowerCase()))] }))
+    .filter(r => r.terms.length > 0);
+
+  if (found.length === 0 && QUESTION.test(text)) {
+    return [{ category: "General Inquiry", terms: ['question'] }];
   }
-  
-  // Technical problem detection
-  if (lowerMessage.includes('bug') || lowerMessage.includes('error') || 
-      lowerMessage.includes('broken') || lowerMessage.includes('not working') ||
-      lowerMessage.includes('crash') || lowerMessage.includes('down') || 
-      lowerMessage.includes('server') || lowerMessage.includes('loading') ||
-      lowerMessage.includes('slow') || lowerMessage.includes('issue') ||
-      lowerMessage.includes("won't load") || lowerMessage.includes('timing out') ||
-      lowerMessage.includes("can't access") || lowerMessage.includes('locked out') ||
-      lowerMessage.includes('connection lost') ||
-      lowerMessage.includes('problem') && !lowerMessage.includes('no problem')) {
-    return {
-      category: "Technical Problem",
-      reasoning: getRandomReasoning('technical')
-    };
-  }
-  
-  // Feature request detection
-  if (lowerMessage.includes('feature') || lowerMessage.includes('add') && (lowerMessage.includes('please') || lowerMessage.includes('could')) ||
-      lowerMessage.includes('improve') || lowerMessage.includes('would like to see') ||
-      lowerMessage.includes('suggestion') || lowerMessage.includes('wish') ||
-      lowerMessage.includes('could you') && lowerMessage.includes('add') ||
-      lowerMessage.includes('enhancement') || lowerMessage.includes('would be great')) {
-    return {
-      category: "Feature Request",
-      reasoning: getRandomReasoning('feature')
-    };
-  }
-  
-  // Question/inquiry detection
-  if (lowerMessage.includes('how') || lowerMessage.includes('what') || 
-      lowerMessage.includes('when') || lowerMessage.includes('where') ||
-      lowerMessage.includes('can i') || lowerMessage.includes('is there') ||
-      lowerMessage.includes('?')) {
-    return {
-      category: "General Inquiry",
-      reasoning: getRandomReasoning('inquiry')
-    };
-  }
-  
-  // Fallback for ambiguous messages: send to a person instead of guessing
+  return found;
+}
+
+function getOfflineCategorization(message, fallbackReason) {
+  const matches = keywordCategories(message);
+  const [primary, ...rest] = matches;
+
   return {
-    category: "Unknown",
-    reasoning: getRandomReasoning('ambiguous')
+    category: primary?.category ?? "Unknown",
+    secondaryCategories: rest.map(r => r.category),
+    urgency: null,
+    sentiment: null,
+    churnRisk: null,
+    reasoning: primary
+      ? `Keyword match: ${matches.map(m => `${m.category} (${m.terms.join(', ')})`).join('; ')}.`
+      : "No category keywords found. A person should review this message.",
+    source: 'offline',
+    fallbackReason,
   };
 }
