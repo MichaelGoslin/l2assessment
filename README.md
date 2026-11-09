@@ -104,6 +104,34 @@ Can I upgrade my subscription to the pro plan?
 The dashboard won't load when I try to access it. I've tried refreshing but it keeps timing out.
 ```
 
+## Triage Accuracy Improvements
+
+Testing the original app with the sample messages showed that it ranked and routed messages wrongly in ways that would cost Relay AI customers:
+
+| Message | Before | After |
+|---|---|---|
+| "Database connection lost" | Low | **High**, escalated (crash or lost connection) |
+| "Server down now" | Low | **High**, escalated (service outage) |
+| "URGENT: ALL CUSTOMERS LOCKED OUT" | Low | **High**, escalated |
+| Long cheerful website compliment with many "!" | High | Low, Positive Feedback |
+| "Could you add an export to CSV feature?" | Action: "check billing portal" | Action: log on the product feedback board |
+| Any message with no API key set | App rendered a blank page | Works, using the offline fallback |
+
+**Top 3 problem areas found**
+
+1. **Urgency scoring rewarded the wrong things.** Short messages were marked Low, every "!" added urgency, ALL CAPS and "?" lowered it, and the time of day changed the result. Real outages came out Low while friendly feedback came out High.
+2. **The AI classification was unreliable.** The prompt asked for free text at temperature 0.7, and the category was picked by checking whether words like "billing" appeared anywhere in the reply. There was no fixed category list, and with no key set the app crashed instead of using its fallback.
+3. **Routing and escalation were wrong.** Feature requests got the billing-portal reply, high-urgency issues got the same reply as minor ones, and escalation was based only on message length over 100 characters.
+
+**What changed**
+
+- `src/utils/urgencyScorer.js`: urgency now comes from business impact signals (outage, crash, lockout, production impact, data loss, security, failed or duplicate payment, "urgent"), and every result lists the signals behind it. The AI may raise urgency, but it can never lower a detected outage or lockout.
+- `src/utils/llmHelper.js`: a system prompt defines the categories and urgency levels, asks for JSON, and runs at temperature 0. The reply is validated, and anything outside the allowed categories becomes `Unknown` so a person reviews it. The Groq client is created only when a key exists, so the offline fallback works. Adds a `Positive Feedback` category.
+- `src/utils/templates.js`: each category has its own action, there are dedicated actions for high-urgency billing and technical issues, and escalation triggers on High urgency or an `Unknown` category.
+- `src/pages/AnalyzePage.jsx`: shows why the urgency was chosen, an **Escalate** badge, and whether the AI or the offline fallback produced the result.
+
+**Known limits:** the keyword rules can misfire on wording like "please slow down the emails" (marked Medium). The AI path was verified for JSON parsing and validation with sample replies but not against a live Groq key in this change.
+
 ## Security Note
 
 ⚠️ **Warning**: This application exposes the Groq API key in the browser (using `dangerouslyAllowBrowser: true`). This is acceptable for local development only but should **NEVER** be done in production. In a real application, API calls should be made from a secure backend server.
