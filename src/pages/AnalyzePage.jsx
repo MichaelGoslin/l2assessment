@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { categorizeMessage } from '../utils/llmHelper'
-import { calculateUrgency } from '../utils/urgencyScorer'
-import { getRecommendedAction } from '../utils/templates'
+import { combineUrgency } from '../utils/urgencyScorer'
+import { getRecommendedAction, shouldEscalate } from '../utils/templates'
 
 function AnalyzePage() {
   const [message, setMessage] = useState('')
@@ -29,13 +29,13 @@ function AnalyzePage() {
     
     try {
       // Run categorization (LLM call)
-      const { category, reasoning } = await categorizeMessage(message)
+      const { category, reasoning, urgency: aiUrgency, source } = await categorizeMessage(message)
       
       // Calculate urgency (rule-based)
-      const urgency = calculateUrgency(message)
+      const { level: urgency, signals: urgencySignals } = combineUrgency(message, aiUrgency)
       
       // Get recommended action (template-based)
-      const recommendedAction = getRecommendedAction(category)
+      const recommendedAction = getRecommendedAction(category, urgency)
       
       const analysisResult = {
         message,
@@ -43,6 +43,9 @@ function AnalyzePage() {
         urgency,
         recommendedAction,
         reasoning,
+        urgencySignals,
+        escalate: shouldEscalate(category, urgency),
+        source,
         timestamp: new Date().toISOString()
       }
 
@@ -146,6 +149,16 @@ function AnalyzePage() {
                 }`}>
                   {results.urgency}
                 </div>
+                {results.escalate && (
+                  <span className="ml-3 inline-block bg-red-600 text-white px-3 py-1 rounded-full text-sm font-semibold">
+                    Escalate
+                  </span>
+                )}
+                <p className="text-sm text-gray-600 mt-2">
+                  {results.urgencySignals?.length
+                    ? `Why: ${results.urgencySignals.join(', ')}`
+                    : 'Why: no outage, access, payment, or error signals found'}
+                </p>
               </div>
 
               <div>
@@ -156,7 +169,9 @@ function AnalyzePage() {
               </div>
 
               <div>
-                <div className="text-sm font-semibold text-gray-600 mb-1">AI Reasoning</div>
+                <div className="text-sm font-semibold text-gray-600 mb-1">
+                  {results.source === 'offline' ? 'Reasoning (offline keyword fallback, AI unavailable)' : 'AI Reasoning'}
+                </div>
                 <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
                   <div className="prose prose-sm max-w-none text-gray-700">
                     <ReactMarkdown>
