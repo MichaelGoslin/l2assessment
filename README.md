@@ -106,6 +106,8 @@ The dashboard won't load when I try to access it. I've tried refreshing but it k
 
 ## Triage Accuracy Improvements
 
+> **Assessment write-up:** see [ASSESSMENT.md](ASSESSMENT.md) for the full audit, the top 3 issues with root causes, the validated triage schema (sentiment, churn risk, confidence, escalation), and before/after test results. Run the tests with `npm test`.
+
 Testing the original app with the sample messages showed that it ranked and routed messages wrongly in ways that would cost Relay AI customers:
 
 | Message | Before | After |
